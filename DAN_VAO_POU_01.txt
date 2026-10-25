@@ -1,0 +1,353 @@
+(* SINGLE-POU COPY - REV 2026-10-18-D1 (native 1s station delay).
+   Paste ENTIRE body into POU_01 / Program [ST]; rebuild before download.
+   D208=K4 (same SCADA). D1=K10: T4/T5 native 100ms timers, 1 second.
+   D2=D4=K60: 6s extension and 6s retraction.
+   Sensor anti-repeat and removal of fault 5 remain from REV D.
+   Use this one POU only. Keep automatic pointers P0..P62.
+*)
+(* Optional separate ST POU; execute every scan before Sorting.st.
+   This configuration is derived from the SELLER'S LE3U manual, not from
+   an original Mitsubishi FX3U Modbus adapter manual.
+   D8120 = H4000 (Modbus RTU slave) + H00A0 (38400) + H0001 (8N1).
+   Verify board revision / communication jumpers during commissioning.
+*)
+MOV(M8002, H40A1, D8120);
+MOV(M8002, K1, D8121);
+
+(* FX-compatible LE3U board. GX Works2 ST PROGRAM BODY.
+   REQUIRED: set compiler automatic pointer allocation to P0..P62,
+   P63 is the special END jump; do not allocate it as an ordinary label.
+   inspect generated code/pointer use before downloading to this clone.
+   X0 START NO; X1 STOP NC; X2 camera; X3 station 1; X4 station 2.
+   16 product slots, two ordered queues. Products must not overtake.
+   Unknown exit = 2 seconds of BELT MOTION after CB3 (configurable D3).
+   TC/TN/TS are the GX Works2 timer coil/current/contact designators.
+   Reserve D0..D250, D1000..D1235, M0..M100, Z0..Z2, T0..T5, T10..T11.
+   Modbus register mapping MUST be checked on the actual board.
+*)
+
+(* Edges, commands, clocks. *)
+M10 := X0 AND NOT M1;
+M11 := X2 AND NOT M2 AND M0 AND X1;
+M12 := X3 AND NOT M3 AND M0 AND X1;
+M13 := X4 AND NOT M4 AND M0 AND X1;
+M14 := M8011 AND NOT M5;
+M15 := D101 <> D42;
+M30 := M8002 OR (M15 AND (D100 = K3) AND NOT M0);
+
+(* Reset is an explicit operator command; remove products first.
+   PC saves/cancels outstanding records BEFORE sending reset. *)
+FMOV(M30, K0, K54, D10);
+FMOV(M30, K0, K6, D70);
+FMOV(M30, K0, K128, D1000);
+FMOV(M30, K0, K36, D1200);
+MOV(M30, K1, D37);
+MOV(M30, K-1, D24);
+MOV(M30, D105, D190);
+MOV(M8002, K0, D190);
+MOV(M8002, K1000, D0);
+MOV(M8002, K10, D1);
+MOV(M8002, K60, D2);
+MOV(M8002, K200, D3);
+MOV(M8002, K60, D4);
+MOV(M8002, K50, D5);
+MOV(M8002, K3000, D6);
+D199 := H5343;
+
+IF M14 THEN
+    D39 := D39 + K1;
+END_IF;
+IF D39 >= K32760 THEN
+    D45 := D45 + K1;
+    D39 := K0;
+END_IF;
+IF M14 AND M31 THEN
+    D41 := D41 + K1;
+END_IF;
+MOV(D41 >= K32760, K0, D41);
+
+(* PC watchdog: heartbeat changes at least once every 2 seconds. *)
+OUT_T(D103 = D40, TC10, K20);
+MOV(TS10 AND M0, K1, D10);
+OUT_T((D24 >= K0) AND M0, TC11, K30);
+MOV(TS11, K2, D10);
+
+(* START/STOP latch, a single assignment to M0.
+   Hardware STOP has priority. A lost PC/model also clears RUN. *)
+M0 := (M0 OR M10 OR (M15 AND (D100 = K1)))
+      AND X1 AND NOT (M15 AND (D100 = K2))
+      AND (D10 = K0) AND (D104 = K1) AND (D190 > K0)
+      AND NOT TS10 AND NOT M8002 AND NOT M30;
+
+(* Class result mailbox: commit, slot, sequence, class, session, generation.
+   Late results cannot overwrite another product or another session. *)
+IF D110 <> D43 THEN
+    IF (D111 >= K0) AND (D111 < K16) AND (D114 = D190) THEN
+        Z0 := D111 * K8;
+        IF (D1000Z0 = D112) AND (D1007Z0 = D115)
+           AND (D1002Z0 = K1) AND (D113 >= K1) AND (D113 <= K3) THEN
+            D1001Z0 := D113;
+        END_IF;
+    END_IF;
+    D43 := D110;
+END_IF;
+
+(* Completion ACK, only after the PC has durably saved the record. *)
+IF D120 <> D44 THEN
+    IF (D121 >= K0) AND (D121 < K16) AND (D123 = D190) THEN
+        Z0 := D121 * K8;
+        IF (D1000Z0 = D122) AND (D1007Z0 = D124)
+           AND ((D1002Z0 = K5) OR (D1002Z0 = K6) OR (D1002Z0 = K8)) THEN
+            FMOV(TRUE, K0, K8, D1000Z0);
+        END_IF;
+    END_IF;
+    D44 := D120;
+END_IF;
+
+(* Remove expired queue HEADS before publishing timeout completion.
+   D5 = 500 ms stable clear to rearm sensors; D6 = 30 s BELT MOTION
+   allowed to reach the next sensor. Stopped time never ages a queue.
+   Stage 8 means sensor passage was missed; it is not a measured exit.
+   A slot is removed from its queue BEFORE PC may ACK/reuse it. *)
+FOR Z2 := K0 TO K15 BY K1 DO
+    Z1 := D30;
+    Z0 := D1200Z1 * K8;
+    D64 := D41 - D1005Z0;
+    MOV(D64 < K0, D64 + K32760, D64);
+    M64 := (D32 > K0) AND (D1002Z0 = K1) AND (D64 >= D6);
+    M65 := (D32 > K0) AND ((D1002Z0 <> K1) OR M64);
+    MOV(M65, (D30 + K1) MOD K16, D30);
+    MOV(M65, D32 - K1, D32);
+    MOV(M64, D39, D1004Z0);
+    MOV(M64, D45, D1005Z0);
+    MOV(M64, K4, D1006Z0);
+    MOV(M64, K8, D1002Z0);
+    Z1 := D33;
+    Z0 := D1220Z1 * K8;
+    D65 := D41 - D1005Z0;
+    MOV(D65 < K0, D65 + K32760, D65);
+    M66 := (D35 > K0) AND (D1002Z0 = K2) AND (D65 >= D6);
+    M67 := (D35 > K0) AND ((D1002Z0 <> K2) OR M66);
+    MOV(M67, (D33 + K1) MOD K16, D33);
+    MOV(M67, D35 - K1, D35);
+    MOV(M66, D39, D1004Z0);
+    MOV(M66, D45, D1005Z0);
+    MOV(M66, K4, D1006Z0);
+    MOV(M66, K8, D1002Z0);
+END_FOR;
+
+(* CB1: reserve one slot; publish sequence LAST. *)
+IF M11 THEN
+    Z0 := D36 * K8;
+    IF (D1000Z0 = K0) AND (D32 < K16) THEN
+        D1001Z0 := K0;
+        D1002Z0 := K1;
+        D1003Z0 := D39;
+        D1004Z0 := K0;
+        D1005Z0 := D41;
+        D1006Z0 := D45;
+        D1007Z0 := D38;
+        D1000Z0 := D37;
+        Z1 := D31;
+        D1200Z1 := D36;
+        D31 := (D31 + K1) MOD K16;
+        D32 := D32 + K1;
+        D36 := (D36 + K1) MOD K16;
+        D37 := D37 + K1;
+        IF D37 >= K32760 THEN
+            D37 := K1;
+            D38 := D38 + K1;
+        END_IF;
+    ELSE
+        D10 := K3;
+    END_IF;
+END_IF;
+
+(* CB2: consume queue 1. If recognition is not ready, hold the belt. *)
+IF M12 THEN
+    IF (D32 > K0) AND (D24 < K0) THEN
+        Z1 := D30;
+        D24 := D1200Z1;
+        D30 := (D30 + K1) MOD K16;
+        D32 := D32 - K1;
+    ELSE
+        D10 := K4;
+    END_IF;
+END_IF;
+
+IF (D24 >= K0) AND M0 AND (D10 = K0) THEN
+    Z0 := D24 * K8;
+    IF D1001Z0 = K1 THEN
+        IF D20 = K0 THEN
+            D22 := D24;
+            D60 := K0;
+            D20 := K1;
+            D1002Z0 := K3;
+            D24 := K-1;
+        ELSE
+            D10 := K6;
+        END_IF;
+    ELSIF (D1001Z0 = K2) OR (D1001Z0 = K3) THEN
+        IF D35 < K16 THEN
+            Z1 := D34;
+            D1220Z1 := D24;
+            D34 := (D34 + K1) MOD K16;
+            D35 := D35 + K1;
+            D1005Z0 := D41;
+            D1002Z0 := K2;
+            D24 := K-1;
+        ELSE
+            D10 := K3;
+        END_IF;
+    END_IF;
+END_IF;
+
+(* CB3: cylinders are sorted here; unknowns keep travelling. *)
+D46 := (D46 + BOOL_TO_INT(M13 AND (D35 = K0))) MOD K32760;
+IF M13 THEN
+    IF D35 > K0 THEN
+        Z1 := D33;
+        D51 := D1220Z1;
+        Z0 := D51 * K8;
+        D33 := (D33 + K1) MOD K16;
+        D35 := D35 - K1;
+        IF D1001Z0 = K2 THEN
+            IF D21 = K0 THEN
+                D23 := D51;
+                D61 := K0;
+                D21 := K1;
+                D1002Z0 := K4;
+            ELSE
+                D10 := K6;
+            END_IF;
+        ELSE
+            D1005Z0 := D41;
+            D1002Z0 := K7;
+        END_IF;
+    END_IF;
+END_IF;
+
+(* An unmatched CB3 no longer latches fault 5 or guesses a type from CB1.
+   Count the untracked passage for diagnostics and let it pass. *)
+
+(* Timing fix D1 - 2026-10-18: native 100 ms timers T4/T5.
+   D1=K10 is 1 second, independent of sampled M8011 rising edges.
+   Read TN4/TN5 BEFORE a disabled OUT_T resets them. D60/D61 retain
+   completed 100 ms units during STOP / another station's belt pause;
+   D62/D63 are the remaining preset. Pause quantization is under 100 ms.
+   T4/T5 reset outside phase 1; each NEW station job clears D60/D61.
+   Extension/retraction timers reset when STOP is pressed.
+   STOP during retraction -> repeat extension on the next START. *)
+MOV((D20 = K1) AND NOT (M0 AND M31), D60 + TN4, D60);
+MOV((D21 = K1) AND NOT (M0 AND M31), D61 + TN5, D61);
+D62 := D1 - D60;
+D63 := D1 - D61;
+MOV((D20 <> K1) OR (D62 < K0), K0, D62);
+MOV((D21 <> K1) OR (D63 < K0), K0, D63);
+OUT_T(M0 AND M31 AND (D20 = K1), TC4, D62);
+OUT_T(M0 AND M31 AND (D21 = K1), TC5, D63);
+OUT_T(M0 AND (D20 = K2), TC0, D2);
+OUT_T(M0 AND (D20 = K3), TC1, D4);
+OUT_T(M0 AND (D21 = K2), TC2, D2);
+OUT_T(M0 AND (D21 = K3), TC3, D4);
+MOV(M0 AND M31 AND TS4 AND (D20 = K1), K2, D20);
+MOV(M0 AND M31 AND TS5 AND (D21 = K1), K2, D21);
+MOV(M0 AND TS0 AND (D20 = K2), K3, D20);
+MOV(M0 AND TS1 AND (D20 = K3), K4, D20);
+MOV(M0 AND TS2 AND (D21 = K2), K3, D21);
+MOV(M0 AND TS3 AND (D21 = K3), K4, D21);
+MOV(NOT M0 AND (D20 = K3), K2, D20);
+MOV(NOT M0 AND (D21 = K3), K2, D21);
+
+M31 := M0 AND (D10 = K0) AND (D24 < K0)
+       AND NOT ((D20 >= K2) AND (D20 <= K3))
+       AND NOT ((D21 >= K2) AND (D21 <= K3));
+
+(* Sorted exit means the moment the BELT ACTUALLY RESUMES. *)
+Z0 := D22 * K8;
+M61 := M31 AND (D20 = K4);
+MOV(M61, D39, D1004Z0);
+MOV(M61, D45, D1005Z0);
+MOV(M61, K1, D1006Z0);
+MOV(M61, K5, D1002Z0);
+MOV(M61, K0, D20);
+Z0 := D23 * K8;
+M62 := M31 AND (D21 = K4);
+MOV(M62, D39, D1004Z0);
+MOV(M62, D45, D1005Z0);
+MOV(M62, K2, D1006Z0);
+MOV(M62, K5, D1002Z0);
+MOV(M62, K0, D21);
+
+(* Unknown exit estimate: 200 x 10 ms of actual conveyor travel. *)
+FOR Z0 := K0 TO K120 BY K8 DO
+    D50 := D41 - D1005Z0;
+    IF D50 < K0 THEN
+        D50 := D50 + K32760;
+    END_IF;
+    M60 := (D1002Z0 = K7) AND M31 AND (D50 >= D3);
+    MOV(M60, D39, D1004Z0);
+    MOV(M60, D45, D1005Z0);
+    MOV(M60, K3, D1006Z0);
+    MOV(M60, K6, D1002Z0);
+END_FOR;
+
+(* Physical outputs: every Y has one owner. *)
+Y0 := M0 AND (D10 = K0);
+Y2 := M0 AND (D10 = K0) AND (D20 = K2);
+Y3 := NOT Y2;
+Y4 := M0 AND (D10 = K0) AND (D21 = K2);
+Y5 := NOT Y4;
+PLSY(M31, D0, K0, Y1);
+
+(* Read-only status window D200..D228. *)
+D200 := BOOL_TO_INT(Y0);
+D201 := BOOL_TO_INT(M31);
+D202 := D20;
+D203 := D21;
+D204 := D10;
+D205 := D32;
+D206 := D35;
+D207 := D190;
+D208 := K4;
+D209 := D39;
+D210 := BOOL_TO_INT(X0) + K2 * BOOL_TO_INT(X1) + K4 * BOOL_TO_INT(X2)
+        + K8 * BOOL_TO_INT(X3) + K16 * BOOL_TO_INT(X4);
+D211 := BOOL_TO_INT(Y0) + K2 * BOOL_TO_INT(M31) + K4 * BOOL_TO_INT(Y2)
+        + K8 * BOOL_TO_INT(Y3) + K16 * BOOL_TO_INT(Y4) + K32 * BOOL_TO_INT(Y5);
+D212 := K16;
+D213 := K1000;
+D214 := D43;
+D215 := D101;
+D216 := D44;
+D217 := D24;
+D218 := D37;
+D219 := D104;
+D220 := D0;
+D221 := D22;
+D222 := D23;
+D223 := D41;
+D224 := D45;
+D225 := D46;
+D226 := BOOL_TO_INT(M2);
+D227 := BOOL_TO_INT(M3);
+D228 := BOOL_TO_INT(M4);
+D40 := D103;
+D42 := D101;
+M1 := X0;
+(* Capture ON immediately, then stay locked until OFF is stable for D5
+   ticks of belt motion. STOP/restart cannot photograph the same high
+   signal again. No ON delay is added between close CB1 and CB2. *)
+MOV(X2, D41, D70);
+MOV(X3, D41, D71);
+MOV(X4, D41, D72);
+D73 := D41 - D70;
+D74 := D41 - D71;
+D75 := D41 - D72;
+MOV(D73 < K0, D73 + K32760, D73);
+MOV(D74 < K0, D74 + K32760, D74);
+MOV(D75 < K0, D75 + K32760, D75);
+M2 := (M2 OR M11) AND NOT M30 AND NOT (NOT X2 AND (D73 >= D5));
+M3 := (M3 OR M12) AND NOT M30 AND NOT (NOT X3 AND (D74 >= D5));
+M4 := (M4 OR M13) AND NOT M30 AND NOT (NOT X4 AND (D75 >= D5));
+M5 := M8011;
